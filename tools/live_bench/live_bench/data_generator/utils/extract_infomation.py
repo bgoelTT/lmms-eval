@@ -1,14 +1,21 @@
-import os
-import openai
-import openai
 import logging
-from bs4 import BeautifulSoup
+import os
+
+import openai
+import openai
 import requests
-from live_bench.data_generator.utils.gpt4v import gpt4v_generate_response, format_gpt4v_images
-from live_bench.data_generator.utils.gpt import api_generate_response, format_api_images
+from bs4 import BeautifulSoup
+from live_bench.data_generator.response import Response
+from live_bench.data_generator.utils.gpt import (
+    api_generate_response,
+    format_api_images,
+)
+from live_bench.data_generator.utils.gpt4v import (
+    format_gpt4v_images,
+    gpt4v_generate_response,
+)
 from live_bench.screen_shoter import ScreenImage
 from live_bench.websites import Website
-from live_bench.data_generator.response import Response
 
 logger = logging.getLogger("live-bench")
 

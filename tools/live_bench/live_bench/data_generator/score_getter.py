@@ -1,15 +1,22 @@
-import os
 import json
+import os
 import random
-import openai
-import openai
 from abc import ABC, abstractmethod
 from typing import List
-from PIL import Image
-from live_bench.screen_shoter import ScreenImage
+
+import openai
+import openai
 from live_bench.data_generator.qa_generator import Response
-from live_bench.data_generator.utils.gpt4v import format_gpt4v_images, gpt4v_generate_response
-from live_bench.data_generator.utils.gpt import format_api_images, api_generate_response
+from live_bench.data_generator.utils.gpt import (
+    api_generate_response,
+    format_api_images,
+)
+from live_bench.data_generator.utils.gpt4v import (
+    format_gpt4v_images,
+    gpt4v_generate_response,
+)
+from live_bench.screen_shoter import ScreenImage
+from PIL import Image
 
 
 class Score(object):
