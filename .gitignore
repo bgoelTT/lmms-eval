@@ -50,3 +50,4 @@ span.log
 uv.lock
 workspace/*
 .gpt/*
+remote_code/*
