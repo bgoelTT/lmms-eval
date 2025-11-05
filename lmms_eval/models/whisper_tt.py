@@ -38,7 +38,7 @@ class WhisperTT(lmms):
         pretrained: str = "openai/whisper-large-v3",
         device: str = "cuda",
         device_map: str = "cuda",
-        batch_size: int = 1000,
+        batch_size: int = 1,
         use_cache: bool = True,
         language: str = "en",
         task: str = "transcribe",
@@ -82,6 +82,7 @@ class WhisperTT(lmms):
         
         self.batch_size_per_gpu = int(batch_size)
         self.use_cache = use_cache
+        self.num_concurrent = int(num_concurrent) if num_concurrent else 1
 
     @property
     def tokenizer(self):
@@ -210,7 +211,6 @@ class WhisperTT(lmms):
         Returns:
             Transcription text
         """
-        eval_logger.info(f"Starting async transcription request for audio {audio_index}")
         # Encode audio to base64 WAV
         base64_audio = self.encode_audio_to_base64_wav(audio_array, sampling_rate)
 
@@ -237,13 +237,13 @@ class WhisperTT(lmms):
                 f"{self.base_url}/audio/transcriptions",
                 json=payload,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=15000)
+                timeout=aiohttp.ClientTimeout(total=self.timeout)
             ) as response:
                 elapsed = time.time() - start_time
 
                 if response.status != 200:
-                    eval_logger.info(f"❌ Image generation for eval failed with status: {response.status}")
-                    return False, elapsed, None
+                    eval_logger.warning(f"Transcription request failed with status: {response.status}")
+                    return ""
 
                 result = await response.json()
                 
@@ -252,18 +252,16 @@ class WhisperTT(lmms):
                 if isinstance(result, dict):
                     # Try common keys for transcription text
                     transcription = result.get('text') or result.get('transcription') or result.get('result')
-                    eval_logger.info(f"Transcription result for audio {audio_index}: {transcription}")
                     if transcription:
                         return transcription
                     # If no known key, return the entire dict as string
-                    eval_logger.info(f"Unexpected response format: {result}")
+                    eval_logger.warning(f"Unexpected response format: {result}")
 
-                eval_logger.info(f"✅ Eval succeeded in {elapsed:.2f}s")
                 return str(result)
 
         except Exception as e:
             elapsed = time.time() - start_time
-            eval_logger.info(f"❌ Image generation for eval failed: {e}")
+            eval_logger.warning(f"Transcription request failed: {e}")
             return ""
 
         return ""
@@ -331,10 +329,15 @@ class WhisperTT(lmms):
         time_end_prep = time.time()
         eval_logger.info(f"Preparation time for {len(all_audios)} requests: {time_end_prep - time_start:.2f}s")
 
-        # Now run all transcriptions in parallel
+        # Now run all transcriptions with concurrency control
         async def run_transcriptions():
+            semaphore = asyncio.Semaphore(self.num_concurrent)
             async with aiohttp.ClientSession() as session:
-                tasks = [self._generate_audio_transcription(session, audio, sampling_rate, i) for i, audio in enumerate(all_audios)]
+                async def bounded_transcribe(audio, index):
+                    async with semaphore:
+                        return await self._generate_audio_transcription(session, audio, sampling_rate, index)
+                
+                tasks = [bounded_transcribe(audio, i) for i, audio in enumerate(all_audios)]
                 return await asyncio.gather(*tasks)
 
         answers = asyncio.run(run_transcriptions())
