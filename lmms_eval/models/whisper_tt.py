@@ -2,7 +2,6 @@ import asyncio
 import base64
 import os
 from io import BytesIO
-import time
 from typing import List, Tuple
 
 import numpy as np
@@ -214,8 +213,6 @@ class WhisperTT(lmms):
         # Encode audio to base64 WAV
         base64_audio = self.encode_audio_to_base64_wav(audio_array, sampling_rate)
 
-        start_time = time.time()
-
         # Prepare request
         url = f"{self.base_url}/audio/transcriptions"
         headers = {
@@ -239,8 +236,6 @@ class WhisperTT(lmms):
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=self.timeout)
             ) as response:
-                elapsed = time.time() - start_time
-
                 if response.status != 200:
                     eval_logger.warning(f"Transcription request failed with status: {response.status}")
                     return ""
@@ -260,7 +255,6 @@ class WhisperTT(lmms):
                 return str(result)
 
         except Exception as e:
-            elapsed = time.time() - start_time
             eval_logger.warning(f"Transcription request failed: {e}")
             return ""
 
@@ -294,8 +288,6 @@ class WhisperTT(lmms):
         all_contexts = []
         all_gen_kwargs_list = []
         
-        time_start = time.time()
-        
         for chunk in chunks:
             contexts, all_gen_kwargs, doc_to_visual, doc_id, task, split = zip(*chunk)
             task = task[0]
@@ -325,9 +317,6 @@ class WhisperTT(lmms):
             all_audios.extend(audios)
             all_contexts.extend(contexts)
             all_gen_kwargs_list.extend([gen_kwargs] * len(contexts))
-            
-        time_end_prep = time.time()
-        eval_logger.info(f"Preparation time for {len(all_audios)} requests: {time_end_prep - time_start:.2f}s")
 
         # Now run all transcriptions with concurrency control
         async def run_transcriptions():
@@ -340,11 +329,11 @@ class WhisperTT(lmms):
                 tasks = [bounded_transcribe(audio, i) for i, audio in enumerate(all_audios)]
                 return await asyncio.gather(*tasks)
 
-        answers = asyncio.run(run_transcriptions())
-        
-        time_end_process = time.time()
-
-        eval_logger.info(f"Total time for {len(all_audios)} requests across all chunks {time_end_process - time_start:.2f}s")
+        try:
+            answers = asyncio.run(run_transcriptions())
+        except Exception as e:
+            eval_logger.error(f"Error while generating: {e}")
+            answers = [""] * len(all_contexts)
 
         # Process results and apply until tokens
         processed_answers = []
@@ -371,10 +360,6 @@ class WhisperTT(lmms):
         res = re_ords.get_original(res)
 
         pbar.close()
-        
-        time_end_process = time.time()
-        
-        eval_logger.info(f"Total time for {len(all_audios)} requests across all chunks {time_end_process - time_start:.2f}s")
 
         return res
 
