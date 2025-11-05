@@ -324,7 +324,9 @@ class WhisperTT(lmms):
             async with aiohttp.ClientSession() as session:
                 async def bounded_transcribe(audio, index):
                     async with semaphore:
-                        return await self._generate_audio_transcription(session, audio, sampling_rate, index)
+                        result = await self._generate_audio_transcription(session, audio, sampling_rate, index)
+                        pbar.update(1)
+                        return result
                 
                 tasks = [bounded_transcribe(audio, i) for i, audio in enumerate(all_audios)]
                 return await asyncio.gather(*tasks)
@@ -334,6 +336,9 @@ class WhisperTT(lmms):
         except Exception as e:
             eval_logger.error(f"Error while generating: {e}")
             answers = [""] * len(all_contexts)
+            # Update progress bar for failed requests
+            for _ in range(len(all_contexts)):
+                pbar.update(1)
 
         # Process results and apply until tokens
         processed_answers = []
@@ -354,7 +359,6 @@ class WhisperTT(lmms):
         for ans, context, gen_kwargs in zip(processed_answers, all_contexts, all_gen_kwargs_list):
             res.append(ans)
             self.cache_hook.add_partial("generate_until", (context, gen_kwargs), ans)
-            pbar.update(1)
 
         # Reorder results back to original unsorted form
         res = re_ords.get_original(res)
