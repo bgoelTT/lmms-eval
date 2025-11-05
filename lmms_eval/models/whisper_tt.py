@@ -37,7 +37,7 @@ class WhisperTT(lmms):
         pretrained: str = "openai/whisper-large-v3",
         device: str = "cuda",
         device_map: str = "cuda",
-        batch_size: int = 1,
+        batch_size: int = 1000,
         use_cache: bool = True,
         language: str = "en",
         task: str = "transcribe",
