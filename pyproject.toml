@@ -137,7 +137,7 @@ exclude = [
 ]
 
 [tool.setuptools.package-data]
-"*" = ["*.json", "*.yaml", "*.yml"]
+"*" = ["*.json", "*.yaml", "*.yml", "_default_template*"]
 
 [tool.wheel]
 exclude = [
