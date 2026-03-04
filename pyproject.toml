@@ -136,6 +136,9 @@ exclude = [
     "logs*",
 ]
 
+[tool.setuptools.package-data]
+"*" = ["*"]
+
 [tool.wheel]
 exclude = [
     "assets*",
