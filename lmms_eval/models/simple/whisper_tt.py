@@ -156,9 +156,10 @@ class WhisperTT(lmms):
         
         payload = {
             "file": base64_audio,
-            "stream": False
+            "stream": False,
+            "is_preprocessing_enabled": False,
         }
-        
+
         # Make request with retries
         for attempt in range(self.max_retries):
             try:
@@ -176,11 +177,13 @@ class WhisperTT(lmms):
                 # Extract transcription text from response
                 # The response format should contain the transcription
                 if isinstance(result, dict):
-                    # Try common keys for transcription text
-                    transcription = result.get('text') or result.get('transcription') or result.get('result')
-                    if transcription:
+                    transcription = result.get('text')
+                    if transcription is None:
+                        transcription = result.get('transcription')
+                    if transcription is None:
+                        transcription = result.get('result')
+                    if transcription is not None:
                         return transcription
-                    # If no known key, return the entire dict as string
                     eval_logger.warning(f"Unexpected response format: {result}")
                     return str(result)
                 else:
@@ -225,7 +228,8 @@ class WhisperTT(lmms):
         
         payload = {
             "file": base64_audio,
-            "stream": False
+            "stream": False,
+            "is_preprocessing_enabled": False,
         }
 
         try:
@@ -246,13 +250,17 @@ class WhisperTT(lmms):
                 # Extract transcription text from response
                 # The response format should contain the transcription
                 if isinstance(result, dict):
-                    # Try common keys for transcription text
-                    transcription = result.get('text') or result.get('transcription') or result.get('result')
+                    transcription = result.get('text')
+                    if transcription is None:
+                        transcription = result.get('transcription')
+                    if transcription is None:
+                        transcription = result.get('result')
                     eval_logger.info(f"Transcription result for audio {audio_index}: {transcription}")
-                    if transcription:
+                    if transcription is not None:
+                        eval_logger.info(f"✅ Eval succeeded in {elapsed:.2f}s")
                         return transcription
-                    # If no known key, return the entire dict as string
                     eval_logger.info(f"Unexpected response format: {result}")
+                    return str(result)
 
                 eval_logger.info(f"✅ Eval succeeded in {elapsed:.2f}s")
                 return str(result)
