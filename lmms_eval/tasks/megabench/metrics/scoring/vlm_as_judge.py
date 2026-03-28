@@ -18,7 +18,7 @@ class OpenAIVLMJudger(abc.ABC):
     def __init__(
         self,
         metric_config,
-        model="gpt-4o-2024-08-06",
+        model="gpt-4o-2024-11-20",
         resize=True,
         max_side=1000,
     ):
@@ -161,9 +161,9 @@ class OpenAIVLMJudger(abc.ABC):
                 if error_info["message"] == "Sorry! We've encountered an issue with repetitive patterns in your prompt. Please try again with a different prompt.":
                     print(query_payload)
                     # If the model's response has too many repetitive tokens, then we give it a score of 0.
-                    print(f"gpt-4o judge query failed...")
+                    print("gpt-4o judge query failed...")
                     return f"**Score explanation**: {error_info['message']}\n\n**Score**: 0"
-                print(f"Retry...")
+                print("Retry...")
             else:
                 response_data = response_
                 break
@@ -177,7 +177,7 @@ class OpenAIVLMJudger(abc.ABC):
                 message_content = choices[0]["message"]["content"]
                 print(f"gpt-4o judge results: {message_content}; tokens:{total_tokens}")
         else:
-            print(f"gpt-4o judge query failed...")
+            print("gpt-4o judge query failed...")
             message_content = ""
 
         return message_content

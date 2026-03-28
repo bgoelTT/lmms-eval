@@ -4,7 +4,7 @@ dataset_kwargs:
 output_type: generate_until
 doc_to_visual: !function utils.openasr_doc_to_audio
 doc_to_text: !function utils.openasr_doc_to_text
-doc_to_target: "gt"
+doc_to_target: !function utils.openasr_doc_to_target
 generation_kwargs:
   max_new_tokens: 4096
   temperature: 0
@@ -25,3 +25,6 @@ lmms_eval_specific_kwargs:
   qwen2_audio:
     pre_prompt: ""
     post_prompt: " <|en|>"
+  qwen2_5_omni:
+    pre_prompt: "Transcribe the English audio into text without any punctuation marks."
+    post_prompt: ""

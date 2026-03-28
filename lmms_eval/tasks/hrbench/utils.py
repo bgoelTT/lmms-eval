@@ -1,16 +1,12 @@
 import base64
-import datetime
 import io
-import json
 import os
 import string
 from collections import defaultdict
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import yaml
-from loguru import logger as eval_logger
 from PIL import Image
 
 from lmms_eval.tasks.hrbench.hrbench_evals import HRBenchEval
@@ -25,7 +21,7 @@ with open(Path(__file__).parent / "hrbench.yaml", "r") as f:
 
     config = yaml.safe_load("".join(safe_data))
 
-hrbench_evaluator = HRBenchEval(api_key=os.getenv("OPENAI_API_KEY", "YOUR_API_KEY"), gpt_model=config["metadata"]["gpt_eval_model_name"], max_workers=config["metadata"]["max_workers"])
+hrbench_evaluator = HRBenchEval(api_key=os.getenv("OPENAI_API_KEY", "YOUR_API_KEY"), gpt_model=os.getenv("MODEL_VERSION", "gpt-4o-2024-11-20"), max_workers=config["metadata"]["max_workers"])
 
 
 def decode_base64_to_image(base64_string, target_size=-1):

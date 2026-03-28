@@ -2,17 +2,15 @@ dataset_path: MathLLMs/MathVision
 dataset_kwargs:
   token: True
 task: "mathvision_testmini"
+tag:
+  - public_eval_seed2_family
 test_split: testmini
 output_type: generate_until
 doc_to_visual: !function utils.mathvision_doc_to_visual
 doc_to_text: !function utils.mathvision_doc_to_text
 doc_to_target: "answer"
 generation_kwargs:
-  max_new_tokens: 1024
-  temperature: 0
-  top_p: 1.0
-  num_beams: 1
-  do_sample: false
+  max_new_tokens: 16384
 process_results: !function utils.mathvision_process_results
 metric_list:
   - metric: mathvision_standard_eval

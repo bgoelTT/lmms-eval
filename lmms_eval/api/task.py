@@ -10,17 +10,13 @@ import re
 import shutil
 import subprocess
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
-from functools import partial
+from dataclasses import asdict, dataclass
+from functools import lru_cache, partial
 from glob import glob
 from typing import (
     Any,
-    Dict,
-    Iterable,
     Iterator,
     List,
-    Literal,
-    Mapping,
     Optional,
     Tuple,
     Union,
@@ -32,6 +28,7 @@ from accelerate import Accelerator
 from datasets import Audio, DownloadConfig, Image, Sequence
 from huggingface_hub import snapshot_download
 from loguru import logger as eval_logger
+from PIL import Image as PIL_Image
 from PIL import ImageFile
 from tenacity import retry, stop_after_attempt, stop_after_delay, wait_fixed
 from tqdm import tqdm
@@ -43,13 +40,13 @@ from lmms_eval.api.registry import (
     AGGREGATION_REGISTRY,
     DEFAULT_METRIC_REGISTRY,
     METRIC_REGISTRY,
-    OUTPUT_TYPE_REGISTRY,
     get_aggregation,
     get_metric,
     get_metric_aggregation,
     is_higher_better,
 )
 from lmms_eval.caching.cache import load_from_cache, save_to_cache
+from lmms_eval.caching.fs_detect import FsType, detect_fs_type, find_local_scratch
 from lmms_eval.filters import build_filter_ensemble
 
 # HuggingfaceM4/NoCaps contains truncated image in test split
@@ -61,7 +58,44 @@ ALL_OUTPUT_TYPES = [
     "multiple_choice",
     "generate_until",
     "generate_until_multi_round",
+    "generate_until_agentic",
 ]
+
+
+def _expand_cache_path(path: str) -> str:
+    return os.path.expanduser(os.path.expandvars(path))
+
+
+@lru_cache(maxsize=1)
+def _resolve_hf_datasets_cache_dir() -> str:
+    """Pick a datasets cache directory that is safe for file locks."""
+
+    explicit_cache_dir = os.getenv("LMMS_EVAL_DATASETS_CACHE", "").strip()
+    if explicit_cache_dir:
+        resolved_cache_dir = _expand_cache_path(explicit_cache_dir)
+        os.makedirs(resolved_cache_dir, exist_ok=True)
+        return resolved_cache_dir
+
+    hf_home = _expand_cache_path(os.getenv("HF_HOME", "~/.cache/huggingface"))
+    target_cache_dir = _expand_cache_path(os.getenv("HF_DATASETS_CACHE", os.path.join(hf_home, "datasets")))
+
+    if detect_fs_type(target_cache_dir) != FsType.REMOTE:
+        os.makedirs(target_cache_dir, exist_ok=True)
+        return target_cache_dir
+
+    local_scratch = find_local_scratch()
+    if local_scratch is None:
+        eval_logger.warning(
+            "HF datasets cache '{}' is on a remote filesystem but no local scratch directory was found; continuing with the remote cache, so file-lock errors may still occur.",
+            target_cache_dir,
+        )
+        os.makedirs(target_cache_dir, exist_ok=True)
+        return target_cache_dir
+
+    local_cache_dir = os.path.join(local_scratch, "lmms_eval_hf_datasets", os.getenv("USER", "unknown"))
+    os.makedirs(local_cache_dir, exist_ok=True)
+    eval_logger.info("HF datasets cache '{}' is on a remote filesystem; using node-local cache '{}'.", target_cache_dir, local_cache_dir)
+    return local_cache_dir
 
 
 @dataclass
@@ -91,6 +125,7 @@ class TaskConfig(dict):
     doc_to_text: Union[Callable, str] = None
     doc_to_target: Union[Callable, str] = None
     doc_to_choice: Union[Callable, str, dict, list] = None
+    doc_to_messages: Callable = None
     process_results: Union[Callable, str] = None
     use_prompt: str = None
     description: str = ""
@@ -108,16 +143,20 @@ class TaskConfig(dict):
     should_decontaminate: bool = False
     doc_to_decontamination_query: str = None
 
+    # Statistical evaluation options
+    cluster_key: str = None  # Field name in process_results dict for clustering (e.g., "videoID")
+    score_key: str = "score"  # Field name in process_results dict for 0/1 score (default: "score")
+
     metadata: Union[str, list] = None  # by default, not used in the code. allows for users to pass arbitrary info to tasks
 
     lmms_eval_specific_kwargs: dict = None
     model_specific_generation_kwargs: dict = None
     model_specific_target_kwargs: dict = None
+    reasoning_tags: Union[str, list] = None
 
     def __post_init__(self) -> None:
         if self.dataset_path and os.path.exists(os.path.dirname(self.dataset_path)):
-            import inspect
-            from importlib import import_module
+            pass
 
             # self.dataset_path = inspect.getfile(import_module(self.dataset_path))
 
@@ -180,7 +219,7 @@ class TaskConfig(dict):
 
 class Task(abc.ABC):
     """A task represents an entire benchmark including its dataset, problems,
-    answers, and evaluation methods. See BoolQ for a simple example implementation
+    answers, and evaluation methods. See MME for a simple example implementation
 
     A `doc` can be any python object which represents one instance of evaluation.
     This is usually a dictionary e.g.
@@ -261,18 +300,19 @@ class Task(abc.ABC):
             - `datasets.DownloadMode.FORCE_REDOWNLOAD`
                 Fresh download and fresh dataset.
         """
+        resolved_cache_dir = cache_dir if cache_dir is not None else _resolve_hf_datasets_cache_dir()
         self.dataset = datasets.load_dataset(
             path=self.DATASET_PATH,
             name=self.DATASET_NAME,
             data_dir=data_dir,
-            cache_dir=cache_dir,
+            cache_dir=resolved_cache_dir,
             download_mode=download_mode,
         )
         self.dataset_no_image = datasets.load_dataset(
             path=self.DATASET_PATH,
             name=self.DATASET_NAME,
             data_dir=data_dir,
-            cache_dir=cache_dir,
+            cache_dir=resolved_cache_dir,
             download_mode=download_mode,
         )
         for doc_name in self.dataset_no_image:
@@ -383,6 +423,7 @@ class Task(abc.ABC):
         self,
         *,
         limit: Union[int, None] = None,
+        offset: int = 0,
         rank: int = 0,
         world_size: int = 1,
         cache_requests: bool = False,
@@ -407,6 +448,8 @@ class Task(abc.ABC):
         og_limit = limit
 
         cache_key = f"requests-{self._config.task}-{self.config.num_fewshot}shot-rank{rank}-world_size{world_size}"
+        if offset:
+            cache_key += f"-offset{offset}"
         cache_key += "-chat_template" if apply_chat_template else ""
         cache_key += "-fewshot_as_multiturn" if fewshot_as_multiturn else ""
         cache_key += f"-system_prompt_hash{utils.hash_string(system_instruction)}" if system_instruction is not None else ""
@@ -430,8 +473,30 @@ class Task(abc.ABC):
         if cache_requests and (not cached_instances or rewrite_requests_cache) and limit is not None:
             limit = None
 
-        doc_id_docs = utils.create_iterator(enumerate(self.eval_docs_no_media), rank=rank, limit=int(limit) if limit else None, world_size=world_size)
-        doc_iterator_for_counting = itertools.islice(range(len(self.test_docs())), rank, limit, world_size) if self.has_test_docs() else itertools.islice(range(len(self.validation_docs())), rank, limit, world_size)
+        doc_id_docs = utils.create_iterator(
+            enumerate(self.eval_docs_no_media),
+            rank=rank,
+            limit=int(limit) if limit else None,
+            world_size=world_size,
+            offset=offset,
+        )
+        doc_iterator_for_counting = (
+            utils.create_iterator(
+                range(len(self.test_docs())),
+                rank=rank,
+                limit=limit,
+                world_size=world_size,
+                offset=offset,
+            )
+            if self.has_test_docs()
+            else utils.create_iterator(
+                range(len(self.validation_docs())),
+                rank=rank,
+                limit=limit,
+                world_size=world_size,
+                offset=offset,
+            )
+        )
 
         num_docs = sum(1 for _ in doc_iterator_for_counting)
 
@@ -470,7 +535,31 @@ class Task(abc.ABC):
         self._instances = flattened_instances
 
         if len(self._instances) == 0:
-            raise ValueError("task.build_requests() did not find any docs!")
+            if world_size > 1:
+                eval_logger.warning(f"task.build_requests() found no docs on rank {rank}/{world_size - 1}; injecting one padding request for distributed synchronization.")
+                if len(self.eval_docs_no_media) > 0:
+                    pad_doc_id = 0
+                    pad_doc = self.eval_docs_no_media[pad_doc_id]
+                    pad_ctx = self.fewshot_context(
+                        pad_doc,
+                        0 if self.config.num_fewshot is None else self.config.num_fewshot,
+                        system_instruction,
+                        apply_chat_template,
+                        fewshot_as_multiturn,
+                        chat_template,
+                    )
+                    pad_metadata = {"task": self.config["task"], "doc_id": pad_doc_id, "repeats": self.config.repeats, "split": split, "__padding_only__": True}
+                    if self.config.metadata and type(self.config.metadata) == dict:
+                        pad_metadata.update(self.config.metadata)
+                    pad_inst = self.construct_requests(doc_id=pad_doc_id, ctx=pad_ctx, metadata=pad_metadata)
+                    if not isinstance(pad_inst, list):
+                        pad_inst = [pad_inst]
+                    self._instances = pad_inst
+                    eval_logger.warning(f"task.build_requests() injected {len(self._instances)} padding request(s) on rank {rank}/{world_size - 1}.")
+                else:
+                    eval_logger.warning(f"task.build_requests() could not inject padding request on rank {rank}/{world_size - 1} because dataset has no docs.")
+            else:
+                raise ValueError("task.build_requests() did not find any docs!")
 
         if cache_requests and (not cached_instances or rewrite_requests_cache):
             save_to_cache(file_name=cache_key, obj=instances)
@@ -659,13 +748,14 @@ class Task(abc.ABC):
         else:
             raise ValueError(f"Task dataset (path={self.DATASET_PATH}, name={self.DATASET_NAME}) must have valid or test docs!")
 
-    def doc_iterator(self, *, rank: int = 0, limit: Union[int, None] = None, world_size: int = 1) -> Iterator[Tuple[int, Any]]:
+    def doc_iterator(self, *, rank: int = 0, limit: Union[int, None] = None, world_size: int = 1, offset: int = 0) -> Iterator[Tuple[int, Any]]:
         limit = int(limit) if limit else None
         doc_iterator = utils.create_iterator(
             enumerate(self.eval_docs),
             rank=int(rank),
             limit=limit,
             world_size=int(world_size),
+            offset=offset,
         )
         return doc_iterator
 
@@ -869,8 +959,9 @@ class ConfigurableTask(Task):
         # Recursively search whether their is a zip and unzip it to the huggingface home
         download_config = DownloadConfig()
         download_config.max_retries = dataset_kwargs.get("max_retries", 10) if dataset_kwargs is not None else 10
-        download_config.num_proc = dataset_kwargs.get("num_proc", 8) if dataset_kwargs is not None else 8
+        download_config.num_proc = dataset_kwargs.get("num_proc", 1) if dataset_kwargs is not None else 1
         download_config.local_files_only = dataset_kwargs.get("local_files_only", False) if dataset_kwargs is not None else False
+        resolved_dataset_cache_dir = _resolve_hf_datasets_cache_dir()
         if dataset_kwargs is not None:
             if "From_YouTube" in dataset_kwargs:
 
@@ -894,11 +985,14 @@ class ConfigurableTask(Task):
                 if accelerator.is_main_process:
                     dataset_kwargs.pop("From_YouTube")
                     assert "load_from_disk" not in dataset_kwargs, "load_from_disk must not be True when From_YouTube is True"
+                    youtube_dataset_kwargs = dict(dataset_kwargs)
+                    youtube_cache_dir = youtube_dataset_kwargs.pop("cache_dir", resolved_dataset_cache_dir)
                     self.all_dataset = datasets.load_dataset(
                         path=self.DATASET_PATH,
                         name=self.DATASET_NAME,
+                        cache_dir=youtube_cache_dir,
                         download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
-                        **dataset_kwargs if dataset_kwargs is not None else {},
+                        **youtube_dataset_kwargs,
                     )
                     dataset_kwargs["From_YouTube"] = True
                     cache_path = snapshot_download(repo_id=self.DATASET_PATH, repo_type="dataset")  # download_parquet
@@ -934,17 +1028,21 @@ class ConfigurableTask(Task):
             if "video" in dataset_kwargs and dataset_kwargs["video"]:
                 hf_home = os.getenv("HF_HOME", "~/.cache/huggingface/")
                 hf_home = os.path.expanduser(hf_home)
-                cache_dir = dataset_kwargs["cache_dir"]
-                cache_dir = os.path.join(hf_home, cache_dir)
+                cache_dir = utils.resolve_cache_dir(dataset_kwargs["cache_dir"], base_dir=hf_home)
                 accelerator = Accelerator()
                 if accelerator.is_main_process:
                     force_download = dataset_kwargs.get("force_download", False)
                     force_unzip = dataset_kwargs.get("force_unzip", False)
                     revision = dataset_kwargs.get("revision", "main")
                     create_link = dataset_kwargs.get("create_link", False)
-                    cache_path = snapshot_download(repo_id=self.DATASET_PATH, revision=revision, repo_type="dataset", force_download=force_download, etag_timeout=60)
-                    zip_files = glob(os.path.join(cache_path, "**/*.zip"), recursive=True)
-                    tar_files = glob(os.path.join(cache_path, "**/*.tar*"), recursive=True)
+                    # If the user already has a cache dir, we skip download the zip files
+                    if not os.path.exists(cache_dir):
+                        cache_path = snapshot_download(repo_id=self.DATASET_PATH, revision=revision, repo_type="dataset", force_download=force_download, etag_timeout=60)
+                        zip_files = glob(os.path.join(cache_path, "**/*.zip"), recursive=True)
+                        tar_files = glob(os.path.join(cache_path, "**/*.tar*"), recursive=True)
+                    else:
+                        zip_files = []
+                        tar_files = []
 
                     def unzip_video_data(zip_file):
                         import os
@@ -988,6 +1086,7 @@ class ConfigurableTask(Task):
                         # Group tar parts together
                         for tar_file in tar_files:
                             base_name = tar_file.split(".tar")[0]
+                            base_name = re.sub(r"_\d+$", "", base_name)
                             if base_name not in tar_parts_dict:
                                 tar_parts_dict[base_name] = []
                             tar_parts_dict[base_name].append(tar_file)
@@ -997,10 +1096,10 @@ class ConfigurableTask(Task):
                             eval_logger.info(f"Extracting following tar files: {parts}")
                             output_tar = base_name + ".tar"
                             if not os.path.exists(output_tar):
-                                eval_logger.info(f"Start concatenating tar files")
+                                eval_logger.info("Start concatenating tar files")
 
                                 concat_tar_parts(parts, output_tar)
-                                eval_logger.info(f"Finish concatenating tar files")
+                                eval_logger.info("Finish concatenating tar files")
 
                             if not os.path.exists(os.path.join(cache_dir, os.path.basename(base_name))):
                                 untar_video_data(output_tar)
@@ -1037,17 +1136,20 @@ class ConfigurableTask(Task):
                 dataset_kwargs.pop("create_link")
 
         if dataset_kwargs is not None and "load_from_disk" in dataset_kwargs and dataset_kwargs["load_from_disk"]:
-            dataset_kwargs.pop("load_from_disk")
             # using local task in offline environment, need to process the online dataset into local format via
             # `ds = load_datasets("lmms-lab/MMMU")`
-            self.dataset = datasets.load_from_disk(path=self.DATASET_PATH, name=self.DATASET_NAME)
+            self.dataset = datasets.load_from_disk(dataset_path=self.DATASET_PATH)
         else:
+            load_dataset_kwargs = dict(dataset_kwargs) if dataset_kwargs is not None else {}
+            load_dataset_cache_dir = load_dataset_kwargs.pop("cache_dir", resolved_dataset_cache_dir)
             self.dataset = datasets.load_dataset(
                 path=self.DATASET_PATH,
                 name=self.DATASET_NAME,
+                cache_dir=load_dataset_cache_dir,
                 download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
                 download_config=download_config,
-                **dataset_kwargs if dataset_kwargs is not None else {},
+                num_proc=1,
+                **load_dataset_kwargs,
             )
 
         if self.config.process_docs is not None:
@@ -1426,6 +1528,8 @@ class ConfigurableTask(Task):
                     # doc=doc,
                     arguments=arg,
                     idx=i,
+                    task_name=self.config.task,
+                    doc_id=doc_id,
                     **kwargs,
                 )
                 for i, arg in enumerate(arguments)
@@ -1445,6 +1549,8 @@ class ConfigurableTask(Task):
                             # doc=doc,
                             arguments=("", "{}".format(choice)),
                             idx=i,
+                            task_name=self.config.task,
+                            doc_id=doc_id,
                             **kwargs,
                         )
                         for i, choice in enumerate(choices)
@@ -1455,6 +1561,8 @@ class ConfigurableTask(Task):
         elif self.OUTPUT_TYPE == "generate_until":
             arguments = (ctx, copy.deepcopy(self.config.generation_kwargs), self.doc_to_visual, doc_id, self.config.task, split)
         elif self.OUTPUT_TYPE == "generate_until_multi_round":
+            arguments = (ctx, copy.deepcopy(self.config.generation_kwargs), self.doc_to_visual, partial(self.config.doc_to_text, lmms_eval_specific_kwargs=self.lmms_eval_specific_kwargs), doc_id, self.config.task, split)
+        elif self.OUTPUT_TYPE == "generate_until_agentic":
             arguments = (ctx, copy.deepcopy(self.config.generation_kwargs), self.doc_to_visual, partial(self.config.doc_to_text, lmms_eval_specific_kwargs=self.lmms_eval_specific_kwargs), doc_id, self.config.task, split)
         return Instance(request_type=self.OUTPUT_TYPE, arguments=arguments, idx=0, **kwargs)
 
@@ -1608,7 +1716,7 @@ class ConfigurableTask(Task):
         else:
             raise ValueError(
                 f"Passed invalid output_type '{self.OUTPUT_TYPE}' ! Please use one of ",
-                "'loglikelihood','generate_until', 'generate_until_multi_round', or 'multiple_choice'",
+                "'loglikelihood','generate_until', 'generate_until_multi_round', 'generate_until_agentic', or 'multiple_choice'",
             )
 
         return result_dict
@@ -1627,4 +1735,73 @@ class ConfigurableTask(Task):
         return getattr(self.config, "task", None)
 
     def __repr__(self):
-        return f"ConfigurableTask(task_name={getattr(self.config, 'task', None)}," f"output_type={self.OUTPUT_TYPE}," f"num_fewshot={getattr(self.config, 'num_fewshot', None)}," f"num_samples={len(self.eval_docs)})"
+        return f"ConfigurableTask(task_name={getattr(self.config, 'task', None)}," f"output_type={self.OUTPUT_TYPE}," f"num_fewshot={getattr(self.config, 'num_fewshot', None)}," f"repeats={getattr(self.config, 'repeats', None)})"
+
+
+class ConfigurableMessagesTask(ConfigurableTask):
+    def __init__(self, data_dir=None, cache_dir=None, download_mode=None, config=None, model_name=None):
+        super().__init__(data_dir, cache_dir, download_mode, config, model_name)
+
+    def doc_to_messages(self, doc: dict) -> Union[int, str, list]:
+        if callable(self.config.doc_to_messages):
+            return (
+                self.config.doc_to_messages(doc, self.lmms_eval_specific_kwargs)
+                if self.lmms_eval_specific_kwargs is not None and len(inspect.signature(self.config.doc_to_messages).parameters) == 2
+                else self.config.doc_to_messages(
+                    doc,
+                )
+            )
+        elif self.config.doc_to_messages is None and (self.config.doc_to_visual is not None or self.config.doc_to_text is not None):
+            # An auto doc to messages function
+            def auto_doc_to_messages(doc):
+                visuals = self.doc_to_visual(doc)
+                if visuals is None:
+                    visuals = []
+                text = self.doc_to_text(doc)
+                messages = [{"role": "user", "content": []}]
+                content = []
+                _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"}
+                _AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".webm"}
+                for visual in visuals:
+                    if isinstance(visual, PIL_Image.Image):
+                        content.append({"type": "image", "url": visual})
+                    elif isinstance(visual, dict):
+                        content.append({"type": "audio", "url": visual})
+                    elif isinstance(visual, str):
+                        ext = os.path.splitext(visual)[1].lower()
+                        if ext in _IMAGE_EXTS:
+                            content.append({"type": "image", "url": visual})
+                        elif ext in _AUDIO_EXTS:
+                            content.append({"type": "audio", "url": visual})
+                        else:
+                            content.append({"type": "video", "url": visual})
+                content.append({"type": "text", "text": text})
+                messages[0]["content"] = content
+                return messages
+
+            return auto_doc_to_messages(doc)
+        else:
+            # eval_logger.warning("Note that doc_to_visual was called but not set in config. Please check if this is a text-only task.")
+            return self.config.doc_to_messages
+
+    def construct_requests(self, doc_id: int, ctx: str, **kwargs) -> Union[List[Instance], Instance]:
+        split = kwargs.get("metadata").get("split")
+        # kwargs.pop("split")
+        assert self.OUTPUT_TYPE in ["generate_until", "generate_until_agentic"], "Currently messages is used for generation only"
+
+        if self.OUTPUT_TYPE == "generate_until_agentic":
+            arguments = (
+                ctx,
+                copy.deepcopy(self.config.generation_kwargs),
+                self.doc_to_visual,
+                partial(self.config.doc_to_text, lmms_eval_specific_kwargs=self.lmms_eval_specific_kwargs),
+                doc_id,
+                self.config.task,
+                split,
+            )
+        else:
+            arguments = (ctx, self.doc_to_messages, copy.deepcopy(self.config.generation_kwargs), doc_id, self.config.task, split)
+        return Instance(request_type=self.OUTPUT_TYPE, arguments=arguments, idx=0, task_name=self.config.task, doc_id=doc_id, **kwargs)
+
+    def __repr__(self):
+        return f"ConfigurableMessagesTask(task_name={getattr(self.config, 'task', None)}," f"output_type={self.OUTPUT_TYPE}," f"num_fewshot={getattr(self.config, 'num_fewshot', None)}," f"repeats={getattr(self.config, 'repeats', None)})"

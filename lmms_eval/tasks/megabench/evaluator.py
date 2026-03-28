@@ -63,7 +63,7 @@ class MEGABenchEvaluator:
         for existing_task in self.eval_results["data"]:
             if task.get("task_name") == existing_task.get("task_name"):
                 task_in_results = True
-                if not "mean_task_score" in existing_task or not "task_score" in existing_task:
+                if "mean_task_score" not in existing_task or "task_score" not in existing_task:
                     return True
 
                 if len(task["query_response"]) != len(existing_task["query_response"]):
@@ -349,8 +349,8 @@ class MEGABenchEvaluator:
         metric = MetricType.from_string(metric_name)
         if metric == MetricType.VLM_AS_JUDGE or metric == MetricType.ASCII_ART_VLM_JUDGE:
             # Build the VLM-as-judge metric using the provided config
-            vlm_eval_configs = score_config.get("gpt4o_eval_configs", None)
-            metric = metric.class_impl(vlm_eval_configs)
+            vlmms_eval_configs = score_config.get("gpt4o_eval_configs", None)
+            metric = metric.class_impl(vlmms_eval_configs)
         return metric
 
     @staticmethod

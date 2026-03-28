@@ -1,12 +1,10 @@
 import abc
-import hashlib
-import json
+import gc
 import os
-from typing import List, Optional, Tuple, Type, TypeVar, Union
+from typing import List, Optional, Tuple, Type, TypeVar
 
-from loguru import logger as eval_logger
-from sqlitedict import SqliteDict
-from tqdm import tqdm
+import torch
+import torch.nn as nn
 
 from lmms_eval import utils
 from lmms_eval.api.instance import Instance
@@ -15,6 +13,8 @@ T = TypeVar("T", bound="lmms")
 
 
 class lmms(abc.ABC):
+    is_simple: bool = True
+
     def __init__(self) -> None:
         """Defines the interface that should be implemented by all lmms subclasses.
         lmmss are assumed to take image-text as input and yield strings as output
@@ -25,6 +25,32 @@ class lmms(abc.ABC):
         self._world_size = 1
         self.cache_hook = CacheHook(None)
         self.task_dict = {}
+
+    @staticmethod
+    def _resolve_system_prompt(value: str) -> str:
+        if value and os.path.isfile(value):
+            with open(value, "r") as f:
+                return f.read().strip()
+        return value
+
+    def _apply_system_prompt(self, messages: list, system_prompt: str) -> list:
+        if not system_prompt:
+            return messages
+
+        use_list_format = True
+        for msg in messages:
+            if isinstance(msg.get("content"), str):
+                use_list_format = False
+                break
+
+        system_content = [{"type": "text", "text": system_prompt}] if use_list_format else system_prompt
+
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = system_content
+        else:
+            messages.insert(0, {"role": "system", "content": system_content})
+
+        return messages
 
     @abc.abstractmethod
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
@@ -126,96 +152,18 @@ class lmms(abc.ABC):
     def set_cache_hook(self, cache_hook) -> None:
         self.cache_hook = cache_hook
 
-
-### SQLite-based caching of LMM responses
-def hash_args(attr, args):
-    dat = json.dumps([attr] + list(args))
-    return hashlib.sha256(dat.encode("utf-8")).hexdigest()
+    def clean(self):
+        for attr_name in list(vars(self)):
+            attr_value = getattr(self, attr_name)
+            if isinstance(attr_value, nn.Module):
+                delattr(self, attr_name)
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 class CacheHook:
-    def __init__(self, cachinglm) -> None:
-        if cachinglm is None:
-            self.dbdict = None
-            return
-
-        self.dbdict = cachinglm.dbdict
+    def __init__(self, cachinglm=None) -> None:
+        pass
 
     def add_partial(self, attr, req, res) -> None:
-        if self.dbdict is None:
-            return
-        hsh = hash_args(attr, req)
-        self.dbdict[hsh] = res
-
-
-class CachingLMM:
-    def __init__(self, lm, cache_db) -> None:
-        """LMM wrapper that returns cached results if they exist, and uses the underlying LMM if not.
-
-        :param lm: LMM
-            Underlying LMM
-        :param cache_db: str
-            Path to cache db
-        """
-        self.lm = lm
-        self.cache_db = cache_db
-        if os.path.dirname(cache_db):
-            os.makedirs(os.path.dirname(cache_db), exist_ok=True)
-        self.dbdict = SqliteDict(cache_db, autocommit=True)
-
-        # add hook to lm
-        lm.set_cache_hook(self.get_cache_hook())
-
-    def __getattr__(self, attr):
-        lm_attr = getattr(self.lm, attr)
-        if not callable(lm_attr):
-            return lm_attr
-
-        def fn(requests):
-            res = []
-            remaining_reqs = []
-            warned = False
-            # figure out which ones are cached and which ones are new
-            eval_logger.info(f"Loading '{attr}' responses from cache '{self.cache_db}' where possible...")
-            for req in tqdm(requests):
-                hsh = hash_args(attr, req.args)
-                if attr in ["generate_until", "generate_until_multi_round"] and req.args[1].get("do_sample", False):
-                    # when we are doing non-greedy generation, don't use the cache
-                    # (else every "randomly sampled" generation would be identical for repeats > 1).
-                    if not warned:
-                        eval_logger.warning(f"Arguments to lm.generate_until() '{req.args[1]}' include non-deterministic sampling. Caching will not be performed for such requests.")
-                        warned = True
-                    res.append(None)
-                    remaining_reqs.append(req)
-                elif hsh in self.dbdict:
-                    ob = self.dbdict[hsh]
-
-                    assert ob is not None
-
-                    res.append(ob)
-                else:
-                    res.append(None)
-                    remaining_reqs.append(req)
-
-            # actually run the LMM on the requests that do not have cached results
-            rem_res = getattr(self.lm, attr)(remaining_reqs)
-
-            # stick the new ones back into the list and also cache any of the new ones
-            resptr = 0
-            for req, r in zip(remaining_reqs, rem_res):
-                while res[resptr] is not None:
-                    resptr += 1
-
-                res[resptr] = r
-
-                # caching
-                hsh = hash_args(attr, req.args)
-                self.dbdict[hsh] = r
-            self.dbdict.commit()
-
-            return res
-
-        return fn
-
-    def get_cache_hook(self):
-        return CacheHook(self)
+        pass
